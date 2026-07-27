@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
-import math
+from conf import conf
 
-import torch_pruning as tp
 
 def pruning_model(model, px, conv1=False):
     # print('start unstructured pruning for all conv layers')
@@ -41,6 +40,42 @@ def check_sparsity(model, conv1=True):
     print('* remain weight = ', 100 * (1 - zero_sum / sum_list), '%')
 
     return 100 * (1 - zero_sum / sum_list)
+
+
+def remove_prune(model, conv1=False):
+    # print('remove pruning')
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            if (name == 'conv1' and conv1) or (name != 'conv1'):
+                prune.remove(m, 'weight')
+
+
+def extract_mask(model_dict):
+    new_dict = {}
+    for key in model_dict.keys():
+        if 'mask' in key:
+            new_dict[key] = model_dict[key]
+
+    return new_dict
+
+
+def extract_main_weight(model_dict):
+    new_dict = {}
+
+    for key in model_dict.keys():
+        if not 'mask' in key:
+            new_dict[key] = model_dict[key]
+
+    return new_dict
+
+
+def prune_model_custom(model, mask_dict, conv1=False):
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            if (name == 'conv1' and conv1) or (name != 'conv1'):
+                # print('pruning layer with custom mask:', name)
+                prune.CustomFromMask.apply(m, 'weight', mask=mask_dict[name + '.weight_mask'].to(m.weight.device))
+
 
 def prune_model_custom_fillback(model, mask_dict, conv1=False, criteria="remain", train_loader=None, init_weight=None,
                                 trained_weight=None, return_mask_only=False, strict=True, fillback_rate=0.0):
@@ -179,117 +214,430 @@ def prune_model_custom_fillback(model, mask_dict, conv1=False, criteria="remain"
     if return_mask_only:
         return masks
 
-def prune_model_custom(model, mask_dict, conv1=False):
+
+def pruning_model_random(model, px):
+    print('start unstructured pruning')
+    parameters_to_prune = []
     for name, m in model.named_modules():
         if isinstance(m, nn.Conv2d):
-            if (name == 'conv1' and conv1) or (name != 'conv1'):
-                # print('pruning layer with custom mask:', name)
-                prune.CustomFromMask.apply(m, 'weight', mask=mask_dict[name + '.weight_mask'].to(m.weight.device))
+            parameters_to_prune.append((m, 'weight'))
 
-class FedLTHPruner:
-    def __init__(self, start_ratio, end_ratio, channel_sparsity,device, speed=0.2, min_inscrease=0.01):
-        self.start_ratio = start_ratio
-        self.end_ratio = end_ratio
-        self.speed = speed
-        self.min_inscrease = min_inscrease
-        self.ratio = start_ratio
-        self.channel_sparsity = channel_sparsity
+    parameters_to_prune = tuple(parameters_to_prune)
 
-        self.unpruned_flag=False
-        self.device=device
+    prune.global_unstructured(
+        parameters_to_prune,
+        pruning_method=prune.RandomUnstructured,
+        amount=px,
+    )
 
-    def _update_ratio(self):
-        delta = self.end_ratio - self.ratio
-        change = delta * (1 - math.exp(-self.speed))
-        if change < self.min_inscrease:
-            change=self.min_inscrease
-        self.ratio += change
+    for name, m in model.named_modules():
+        index = 0
+        if isinstance(m, nn.Conv2d):
+            origin_mask = m.weight_mask
+            # print((origin_mask == 0).sum().float() / origin_mask.numel())
+            # print(index)
+            index += 1
+            # print(name, (origin_mask == 0).sum())
 
-    def _extract_mask(self,model_dict):
-        new_dict = {}
-        for key in model_dict.keys():
-            if 'mask' in key:
-                new_dict[key] = model_dict[key]
-        return new_dict
 
-    def unstuctured_prune(self, model, conv1=False):
-        self._update_ratio()
-        self.unpruned_flag=True
-        pruning_model(model, self.ratio, conv1=conv1)
-    
-    def structured_prune(self, model, weight_with_mask, trace_data_loader, criterion, num_classes):
-        prune_mask = self._refill(model,None,weight_with_mask,trace_data_loader, mask_only=True) # init_weight can be None when return mask_only
-        prune_model_custom(model, prune_mask, conv1=False)
-        self.remove_prune(model, conv1=False)
-        model.zero_grad()
-        trace_data=next(iter(trace_data_loader))
-        return self._tp_prune(model,trace_data,criterion,num_classes,self.channel_sparsity, imp_strategy='Magnitude',degree=1)
+def prune_snip(model, train_loader, loss, rate):
+    scores = {}
+    masks = {}
+    model.train()
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(conf['global_dev']), target.to(conf['global_dev'])
+        output = model(data)
+        loss(output, target).backward()
 
-    def _refill(self,model,init_weight,weight_with_mask,train_loader,mask_only=False):
-        current_mask = self._extract_mask(weight_with_mask)
-        if mask_only:
-            return prune_model_custom_fillback(model, current_mask, criteria='remain', train_loader=train_loader,trained_weight=model.state_dict(),init_weight=init_weight,return_mask_only=True)
-        else:
-            return prune_model_custom_fillback(model, current_mask, criteria='remain', train_loader=train_loader,trained_weight=model.state_dict(),init_weight=init_weight)
-    
-    # Torch_pruning结构化剪枝,imp_strategy=Magnitude/Taylor(Default)/Hessian
-    def _tp_prune(self, model, trace_data,criterion,num_classes,
-                    ratio, imp_strategy='Taylor', degree=2, iterative_steps=1, show_step=False, show_group=False):
-        # print(f'Channel Ratio:{ratio}')
-        if imp_strategy == 'Magnitude':
-            assert degree == 1 or degree == 2  # degree must be 1 or 2
-            imp = tp.importance.MagnitudeImportance(p=degree)
-        elif imp_strategy == 'Taylor':
-            imp = tp.importance.TaylorImportance()
-        elif imp_strategy == 'Hessian':
-            imp = tp.importance.HessianImportance()
-        else:
-            return
+    # calculate score |g * theta|
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d) and name != 'conv1':
+            # print(m.weight.grad)
+            scores[name] = torch.clone(m.weight.grad * m.weight).detach().abs_()
+            m.weight.grad.data.zero_()
 
-        # Ignore some layers, e.g., the output layer
-        ignored_layers = []
-        for m in model.modules():
-            if isinstance(m, torch.nn.Linear) and m.out_features == num_classes:
-                ignored_layers.append(m)  # DO NOT prune the final classifier!
+    # normalize score
+    all_scores = torch.cat([torch.flatten(v) for v in scores.values()])
+    all_scores = all_scores
+    threshold = torch.kthvalue(all_scores, int(len(all_scores) * rate))[0]
 
-        trace_input,trace_label=trace_data
-        trace_input=trace_input.to(self.device)
-        # Initialize a pruner
-        pruner = tp.pruner.MagnitudePruner(
-                model,
-                trace_input,
-                importance=imp,
-                iterative_steps=iterative_steps,
-                pruning_ratio=ratio,  # remove 50% channels, ResNet18 = {64, 128, 256, 512} => ResNet18_Half = {32, 64, 128, 256}
-                ignored_layers=ignored_layers,
-                )
+    for name in list(scores.keys()):
+        mask = torch.where(scores[name] < threshold, torch.tensor(0.0).to(conf['global_dev']), torch.tensor(1.0).to(conf['global_dev']))
+        masks[name + ".weight_mask"] = mask
 
-        # prune the model, iteratively if necessary.
-        base_macs, base_nparams = tp.utils.count_ops_and_params(model, trace_input)
-        macs, nparams = base_macs, base_nparams
-        for i in range(iterative_steps):
-            if isinstance(imp, tp.importance.TaylorImportance):
-                # # A dummy loss, please replace it with your loss function and data!
-                # loss = model(trace_input).sum()
-                # loss.backward()  # before pruner.step()
-                output = model(trace_input)
-                loss = criterion(output, trace_label)
-                loss.backward()  # before pruner.step()
-            if show_group:
-                for group in pruner.step(interactive=True):  # Warning: groups must be handled sequentially. Do not keep them as a list.
-                    # print(group)
-                    group.prune()
-            else:
-                pruner.step()
-            macs, nparams = tp.utils.count_ops_and_params(model, trace_input)
-            if show_step:
-                print('Current sparsity:' + str(100 * nparams / base_nparams) + '%')
+    return masks
 
-        return nparams/base_nparams
-    
-    def remove_prune(self, model, conv1=False):
-    # print('remove pruning')
+
+def prune_synflow(model, train_loader, loss, rate):
+    model.eval()
+    scores = {}
+    masks = {}
+    model.zero_grad()
+
+    @torch.no_grad()
+    def linearize(model):
+        # model.double()
+        signs = {}
+        for name, param in model.state_dict().items():
+            signs[name] = torch.sign(param)
+            param.abs_()
+        return signs
+
+    @torch.no_grad()
+    def nonlinearize(model, signs):
+        # model.float()
+        for name, param in model.state_dict().items():
+            param.mul_(signs[name])
+
+    for epoch in range(100):
+        signs = linearize(model)
+        (data, _) = next(iter(train_loader))
+        input_dim = list(data[0, :].shape)
+        input = torch.ones([1] + input_dim).to(conf['global_dev'])  # ,dtype=torch.float64).to(device)
+        output = model(input)
+        torch.sum(output).backward()
+
+        # calculate score |g * theta|
         for name, m in model.named_modules():
-            if isinstance(m, nn.Conv2d):
-                if (name == 'conv1' and conv1) or (name != 'conv1'):
-                    prune.remove(m, 'weight')
+            if isinstance(m, nn.Conv2d) and name != 'conv1':
+                scores[name] = torch.clone(m.weight.grad * m.weight).detach().abs_()
+                m.weight.grad.data.zero_()
+        nonlinearize(model, signs)
+
+        # normalize score
+        all_scores = torch.cat([torch.flatten(v) for v in scores.values()])
+        threshold = torch.kthvalue(all_scores, int(len(all_scores) * ((rate * 100) ** ((epoch + 1) / 100) / 100)))[0]
+        norm = torch.sum(all_scores)
+        for name in list(scores.keys()):
+            mask = torch.where(scores[name] < threshold, torch.tensor(0.0).to(conf['global_dev']), torch.tensor(1.0).to(conf['global_dev']))
+            masks[name + ".weight_mask"] = mask
+        for name, m in model.named_modules():
+            if isinstance(m, nn.Conv2d) and name != 'conv1':
+                m.weight.data.mul_(masks[name + ".weight_mask"])
+    return masks
+
+
+def prune_grasp(model, train_loader, loss, rate):
+    model.train()
+    scores = {}
+    masks = {}
+    stopped_grads = 0
+    masked_parameters = []
+
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d) and name != 'conv1':
+            masked_parameters.append(m.weight)
+
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(conf['global_dev']), target.to(conf['global_dev'])
+        output = model(data) / 200
+        L = loss(output, target)
+        grads = torch.autograd.grad(
+            L, masked_parameters, create_graph=False
+        )
+
+        flatten_grads = torch.cat([g.reshape(-1) for g in grads if g is not None])
+        stopped_grads += flatten_grads
+
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(conf['global_dev']), target.to(conf['global_dev'])
+        output = model(data) / 200
+        L = loss(output, target)
+
+        grads = torch.autograd.grad(L, masked_parameters, create_graph=True)
+        flatten_grads = torch.cat([g.reshape(-1) for g in grads if g is not None])
+
+        gnorm = (stopped_grads * flatten_grads).sum()
+        gnorm.backward()
+
+    # calculate score |g * theta|
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d) and name != 'conv1':
+            scores[name] = torch.clone(m.weight.grad * m.weight).detach().abs_()
+            m.weight.grad.data.zero_()
+
+    # normalize score
+    all_scores = torch.cat([torch.flatten(v) for v in scores.values()])
+    threshold = torch.kthvalue(all_scores, int(len(all_scores) * rate))[0]
+    norm = torch.sum(all_scores)
+    for name in scores:
+        mask = torch.where(scores[name] < threshold, torch.tensor(0.0).to(conf['global_dev']), torch.tensor(1.0).to(conf['global_dev']))
+        masks[name + ".weight_mask"] = mask
+
+    return masks
+
+
+def prune_omp(model, train_loader, loss, rate):
+    scores = {}
+    masks = {}
+    # calculate score |g * theta|
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d) and name != 'conv1':
+            scores[name] = torch.clone(m.weight.data).detach().abs_()
+    # normalize score
+    all_scores = torch.cat([torch.flatten(v) for v in scores.values()])
+    threshold = torch.kthvalue(all_scores, int(len(all_scores) * rate))[0]
+    for name in list(scores.keys()):
+        mask = torch.where(scores[name] < threshold, torch.tensor(0.0).to(conf['global_dev']), torch.tensor(1.0).to(conf['global_dev']))
+        masks[name + ".weight_mask"] = mask
+
+    return masks
+
+
+def prune_rp(model, train_loader, loss, rate):
+    scores = {}
+    masks = {}
+    # calculate score |g * theta|
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d) and name != 'conv1':
+            scores[name] = torch.randn(m.weight.data.shape).to(m.weight.data.device).detach().abs_()
+    # normalize score
+    all_scores = torch.cat([torch.flatten(v) for v in scores.values()])
+    threshold = torch.kthvalue(all_scores, int(len(all_scores) * rate))[0]
+    for name in list(scores.keys()):
+        mask = torch.where(scores[name] < threshold, torch.tensor(0.0).to(conf['global_dev']), torch.tensor(1.0).to(conf['global_dev']))
+        masks[name + ".weight_mask"] = mask
+
+    return masks
+
+
+def regroup(sparse_kernel, t1=1.5, nn=32, B2=16, cn=8):
+    nrows = sparse_kernel.shape[0]
+    ncols = sparse_kernel.shape[1]
+
+    nonempty_rows = []
+    for i in range(nrows):
+        nz = 0
+        for j in range(ncols):
+            if sparse_kernel[i, j] != 0:
+                nonempty_rows.append(i)
+                break
+    # print (nrows, len(nonempty_rows))
+
+    nonempty_cols = []
+    for j in range(ncols):
+        nz = 0
+        for i in nonempty_rows:
+            if sparse_kernel[i, j] != 0:
+                nonempty_cols.append(j)
+                break
+    # print (ncols, len(nonempty_cols))
+    tempname = str(uuid.uuid1())
+    tmp = open(tempname, "w")
+    tmp.write(str(len(nonempty_cols)) + ' ' + str(len(nonempty_rows)) + '\n')
+    for j in range(len(nonempty_cols)):
+        for i in range(len(nonempty_rows)):
+            if sparse_kernel[nonempty_rows[i], nonempty_cols[j]] != 0:
+                tmp.write(str(i + 1) + ' ')
+        tmp.write('\n')
+
+    tmp.close()
+
+    os.system(f'./shmetis {tempname} {cn} 10 > /dev/null 2>&1')  # Attention: Only Work on Linux
+    from glob import glob
+    file_to_find = glob(f'{tempname}.part.*')
+    try:
+        f = open(file_to_find[0], 'r')
+        clusters = {}
+        s = f.readlines()
+    except:
+        return sparse_kernel
+    # print (len(s))
+
+    assert (len(s) == len(nonempty_rows))
+
+    for i in range(len(s)):
+        t = int(s[i].strip())
+        if t not in clusters:
+            clusters[t] = []
+        clusters[t].append(i)
+    f.close()
+
+    os.system(f'rm {tmp.name}')
+
+    clusters = [clusters[c] for c in clusters]
+    clusters.sort(key=lambda x: len(x), reverse=True)
+
+    blocks = []
+
+    for r in clusters:
+        nnz_cols = [0] * ncols
+        for i in range(ncols):
+            s = 0
+            for rr in r:
+                if sparse_kernel[nonempty_rows[rr], i] != 0:
+                    s += 1
+            nnz_cols[i] = s
+        cc = sorted(list(range(ncols)), key=lambda x: nnz_cols[x], reverse=True)
+        nnz_rows = [0] * len(r)
+
+        for i in range(len(r)):
+            for j in range(ncols):
+                if sparse_kernel[nonempty_rows[r[i]], j] != 0:
+                    nnz_rows[i] += 1
+
+        for i in range(1, ncols):
+            dense_cols = cc[:i]
+            flag = False
+            for j in range(len(r)):
+                # print(i, j)
+                # print(sparse_kernel[nonempty_rows[r[j]], i])
+                # print(nnz_rows[j])
+                if sparse_kernel[nonempty_rows[r[j]], i] != 0:
+                    nnz_rows[j] -= 1
+                if i <= t1 * nnz_rows[j]:
+                    flag = True
+                    break
+
+            if flag == False:
+                dense_rows = [nonempty_rows[i] for i in r]
+                # print (len(dense_rows), len(dense_cols))
+                if len(dense_rows) > nn:
+                    dense_rows_1 = dense_rows[:len(dense_rows) // nn * nn]
+                    dense_rows_2 = dense_rows[len(dense_rows) // nn * nn:]
+                    blocks.append((dense_rows_1, dense_cols))
+                    blocks.append((dense_rows_2, dense_cols))
+                elif len(dense_rows) > B2:
+                    blocks.append((dense_rows, dense_cols))
+                break
+
+    new_mask = torch.zeros_like(sparse_kernel)
+    if len(blocks) > 0:
+        for b in blocks:
+            for r in b[0]:
+                for c in b[1]:
+                    new_mask[r, c] = 1
+        return new_mask
+    else:
+        return sparse_kernel
+
+
+import numpy as np
+
+
+def initialize_Z_and_U(model):
+    Z = ()
+    U = ()
+    for name, param in model.named_parameters():
+        if name.split('.')[-1] == "weight":
+            Z += (param.detach().cpu().clone(),)
+            U += (torch.zeros_like(param).cpu(),)
+    return Z, U
+
+
+def update_X(model):
+    X = ()
+    for name, param in model.named_parameters():
+        if name.split('.')[-1] == "weight":
+            X += (param.detach().cpu().clone(),)
+    return X
+
+
+def update_Z(X, U, args):
+    new_Z = ()
+    idx = 0
+    for x, u in zip(X, U):
+        z = x + u
+        pcen = np.percentile(abs(z), 100 * args.percent[idx])
+        under_threshold = abs(z) < pcen
+        z.data[under_threshold] = 0
+        new_Z += (z,)
+        idx += 1
+    return new_Z
+
+
+def update_Z_l1(X, U, alpha=5e-4, rho=1e-2):
+    new_Z = ()
+    delta = alpha / rho
+    for x, u in zip(X, U):
+        z = x + u
+        new_z = z.clone()
+        if (z > delta).sum() != 0:
+            new_z[z > delta] = z[z > delta] - delta
+        if (z < -delta).sum() != 0:
+            new_z[z < -delta] = z[z < -delta] + delta
+        if (abs(z) <= delta).sum() != 0:
+            new_z[abs(z) <= delta] = 0
+        new_Z += (new_z,)
+    return new_Z
+
+
+def update_U(U, X, Z):
+    new_U = ()
+    for u, x, z in zip(U, X, Z):
+        new_u = u + x - z
+        new_U += (new_u,)
+    return new_U
+
+
+import torch.nn.functional as F
+
+
+def admm_loss(model, Z, U, output, target, rho=1e-2):
+    idx = 0
+    loss = F.nll_loss(output, target)
+    for name, param in model.named_parameters():
+        if name.split('.')[-1] == "weight":
+            u = U[idx].to(conf['global_dev'])
+            z = Z[idx].to(conf['global_dev'])
+            loss += rho / 2 * (param - z + u).norm()
+            idx += 1
+    return loss
+
+
+def prune_admm(model, train_loader, loss, rate, optimizer):
+    Z, U = initialize_Z_and_U(model)
+    for epoch in range(20):
+        model.train()
+        # print('Epoch: {}'.format(epoch + 1))
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(conf['global_dev']), target.to(conf['global_dev'])
+            optimizer.zero_grad()
+            output = model(data)
+            loss = admm_loss(model, Z, U, output, target)
+            loss.backward()
+            optimizer.step()
+        X = update_X(model)
+        Z = update_Z_l1(X, U)
+        U = update_U(U, X, Z)
+
+    scores = {}
+    masks = {}
+    # calculate score |g * theta|
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d) and name != 'conv1':
+            scores[name] = torch.clone(m.weight.data).detach().abs_()
+            # print(scores[name])
+    # normalize score
+    all_scores = torch.cat([torch.flatten(v) for v in scores.values()])
+    threshold = torch.kthvalue(all_scores, int(len(all_scores) * rate))[0]
+    for name in list(scores.keys()):
+        mask = torch.where(scores[name] < threshold, torch.tensor(0.0).to(conf['global_dev']), torch.tensor(1.0).to(conf['global_dev']))
+        masks[name + ".weight_mask"] = mask
+
+    return masks
+
+
+######以下是torch——pruning库剪枝
+import torch_pruning as tp
+
+
+class MySlimmingImportance(tp.importance.Importance):
+    def __call__(self, group, **kwargs):
+        group_imp = []
+        for dep, idxs in group:
+            layer = dep.target.module
+            prune_fn = dep.handler
+            if isinstance(layer, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)) and layer.affine:
+                importance_scores = torch.abs(layer.weight.data)  # 使用 L1 范数计算重要性
+                group_imp.append(importance_scores)
+        if len(group_imp) == 0: return None
+        group_imp = torch.stack(group_imp, dim=0).mean(dim=0)
+        return group_imp
+
+
+class MySlimmingPruner(tp.pruner.MetaPruner):
+    def regularize(self, model, reg):
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)) and m.affine:
+                m.weight.grad.data.add_(reg * torch.sign(m.weight.data))
